@@ -3,7 +3,9 @@
 package zfs
 
 import (
+	"bytes"
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +18,47 @@ import (
 type poolInfo struct {
 	name       string
 	ioFilename string
+}
+
+func (z *Zfs) gatherDatasetStats(acc telegraf.Accumulator) (string, error) {
+	properties := []string{"name", "avail", "used", "usedsnap", "usedds"}
+
+	lines, err := z.zdataset(properties)
+	if err != nil {
+		return "", err
+	}
+
+	datasets := []string{}
+	for _, line := range lines {
+		col := strings.Split(line, "\t")
+
+		datasets = append(datasets, col[0])
+	}
+
+	if z.DatasetMetrics {
+		for _, line := range lines {
+			col := strings.Split(line, "\t")
+			if len(col) != len(properties) {
+				z.Log.Warnf("Invalid number of columns for line: %s", line)
+				continue
+			}
+
+			tags := map[string]string{"dataset": col[0]}
+			fields := map[string]interface{}{}
+
+			for i, key := range properties[1:] {
+				value, err := strconv.ParseInt(col[i+1], 10, 64)
+				if err != nil {
+					return "", fmt.Errorf("Error parsing %s %q: %s", key, col[i+1], err)
+				}
+				fields[key] = value
+			}
+
+			acc.AddFields("zfs_dataset", fields, tags)
+		}
+	}
+
+	return strings.Join(datasets, "::"), nil
 }
 
 func getPools(kstatPath string) []poolInfo {
@@ -77,6 +120,22 @@ func gatherPoolStats(pool poolInfo, acc telegraf.Accumulator) error {
 	return nil
 }
 
+func run(command string, args ...string) ([]string, error) {
+	cmd := exec.Command(command, args...)
+	var outbuf, errbuf bytes.Buffer
+	cmd.Stdout = &outbuf
+	cmd.Stderr = &errbuf
+	err := cmd.Run()
+
+	stdout := strings.TrimSpace(outbuf.String())
+	stderr := strings.TrimSpace(errbuf.String())
+
+	if _, ok := err.(*exec.ExitError); ok {
+		return nil, fmt.Errorf("%s error: %s", command, stderr)
+	}
+	return strings.Split(stdout, "\n"), nil
+}
+
 func (z *Zfs) Gather(acc telegraf.Accumulator) error {
 	kstatMetrics := z.KstatMetrics
 	if len(kstatMetrics) == 0 {
@@ -103,6 +162,11 @@ func (z *Zfs) Gather(acc telegraf.Accumulator) error {
 			}
 		}
 	}
+	datasetNames, err := z.gatherDatasetStats(acc)
+	if err != nil {
+		return err
+	}
+	tags["datasets"] = datasetNames
 
 	fields := make(map[string]interface{})
 	for _, metric := range kstatMetrics {
@@ -131,8 +195,12 @@ func (z *Zfs) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
+func zdataset(properties []string) ([]string, error) {
+	return run("zfs", []string{"list", "-Hp", "-o", strings.Join(properties, ",")}...)
+}
+
 func init() {
 	inputs.Add("zfs", func() telegraf.Input {
-		return &Zfs{}
+		return &Zfs{zdataset: zdataset}
 	})
 }
